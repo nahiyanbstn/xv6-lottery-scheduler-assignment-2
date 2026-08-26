@@ -1,0 +1,263 @@
+diff --git a/Makefile b/Makefile
+index af1e7a5..6711ba0 100644
+--- a/Makefile
++++ b/Makefile
+@@ -150,6 +150,7 @@ UPROGS=\
+ 	$U/_forphan\
+ 	$U/_dorphan\
+ 	$U/_sync\
++	$U/_test_scheduler\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+@@ -171,7 +172,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 3
++CPUS := 1
+ endif
+ 
+ QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+diff --git a/kernel/proc.c b/kernel/proc.c
+index f4c1668..8e4aa37 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -15,6 +15,30 @@ struct proc *initproc;
+ int nextpid = 1;
+ struct spinlock pid_lock;
+ 
++int
++do_rand(unsigned long *ctx)
++{
++  long hi, lo, x;
++
++  x = (*ctx % 0x7ffffffe) + 1;
++  hi = x / 127773;
++  lo = x % 127773;
++  x = 16807 * lo - 2836 * hi;
++  if (x < 0)
++    x += 0x7fffffff;
++  x--;
++  *ctx = x;
++  return x;
++}
++
++unsigned long rand_next = 1;
++
++int
++rand(void)
++{
++  return do_rand(&rand_next);
++}
++
+ extern void forkret(void);
+ static void freeproc(struct proc *p);
+ 
+@@ -124,6 +148,8 @@ allocproc(void)
+ found:
+   p->pid = allocpid();
+   p->state = USED;
++  p->tickets = 10;
++  p->rounds = 0;
+ 
+   // Allocate a trapframe page.
+   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
+@@ -167,6 +193,8 @@ freeproc(struct proc *p)
+   p->chan = 0;
+   p->killed = 0;
+   p->xstate = 0;
++  p->tickets = 0;
++  p->rounds = 0;
+   p->state = UNUSED;
+ }
+ 
+@@ -274,6 +302,7 @@ kfork(void)
+     return -1;
+   }
+   np->sz = p->sz;
++  np->tickets = p->tickets;
+ 
+   // copy saved user registers.
+   *(np->trapframe) = *(p->trapframe);
+@@ -441,30 +470,40 @@ scheduler(void)
+     intr_on();
+     intr_off();
+ 
+-    int found = 0;
++    uint64 total_tickets = 0;
+     for (p = proc; p < &proc[NPROC]; p++) {
+       acquire(&p->lock);
+-      if (p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+-        swtch(&c->context, &p->context);
+-
+-        // Don't re-enable interrupts on release.
+-        mycpu()->intena = 0;
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
+-        found = 1;
+-      }
++      if (p->state == RUNNABLE)
++        total_tickets += p->tickets;
+       release(&p->lock);
+     }
+-    if (found == 0) {
++
++    if (total_tickets == 0) {
+       // nothing to run; stop running on this core until an interrupt.
+       asm volatile("wfi");
++      continue;
++    }
++
++    uint64 winning_ticket = (uint64)rand() % total_tickets;
++    uint64 current_ticket = 0;
++    for (p = proc; p < &proc[NPROC]; p++) {
++      acquire(&p->lock);
++      if (p->state == RUNNABLE) {
++        current_ticket += p->tickets;
++        if (current_ticket > winning_ticket) {
++          p->state = RUNNING;
++          p->rounds++;
++          c->proc = p;
++          swtch(&c->context, &p->context);
++
++          // Don't re-enable interrupts on release.
++          mycpu()->intena = 0;
++          c->proc = 0;
++          release(&p->lock);
++          break;
++        }
++      }
++      release(&p->lock);
+     }
+   }
+ }
+@@ -695,7 +734,8 @@ procdump(void)
+       state = states[p->state];
+     else
+       state = "???";
+-    printk("%d %s %s", p->pid, state, p->name);
++    printk("%d %s %s tickets=%d rounds=%ld", p->pid, state, p->name,
++           p->tickets, p->rounds);
+     printk("\n");
+   }
+ }
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 5603697..3a0a7a0 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -88,6 +88,8 @@ struct proc {
+   int killed;           // If non-zero, have been killed
+   int xstate;           // Exit status to be returned to parent's wait
+   int pid;              // Process ID
++  int tickets;          // Lottery scheduling tickets
++  uint64 rounds;        // Number of times scheduled
+ 
+   // wait_lock must be held when using this:
+   struct proc *parent; // Parent process
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1800f20..47bf648 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -103,6 +103,7 @@ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+ extern uint64 sys_sync(void);
++extern uint64 sys_settickets(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -130,6 +131,7 @@ static uint64 (*syscalls[])(void) = {
+   [SYS_mkdir]   = sys_mkdir,
+   [SYS_close]   = sys_close,
+   [SYS_sync]    = sys_sync,
++  [SYS_settickets] = sys_settickets,
+   // clang-format on
+ };
+ 
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 5a4a39f..948497a 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -21,3 +21,4 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_sync   22
++#define SYS_settickets 23
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index cd25557..f9ca3c8 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -22,6 +22,18 @@ sys_getpid(void)
+   return myproc()->pid;
+ }
+ 
++uint64
++sys_settickets(void)
++{
++  int n;
++
++  argint(0, &n);
++  if (n <= 0)
++    return -1;
++  myproc()->tickets = n;
++  return 0;
++}
++
+ uint64
+ sys_fork(void)
+ {
+diff --git a/user/test_scheduler.c b/user/test_scheduler.c
+new file mode 100644
+index 0000000..615cb22
+--- /dev/null
++++ b/user/test_scheduler.c
+@@ -0,0 +1,20 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++int
++main(int argc, char *argv[])
++{
++  if (argc != 2) {
++    fprintf(2, "usage: test_scheduler tickets\n");
++    exit(1);
++  }
++
++  int tickets = atoi(argv[1]);
++  if (tickets <= 0 || settickets(tickets) < 0) {
++    fprintf(2, "test_scheduler: tickets must be a positive integer\n");
++    exit(1);
++  }
++
++  for (;;)
++    ;
++}
+diff --git a/user/user.h b/user/user.h
+index 29aad59..f8623db 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -25,6 +25,7 @@ char *sys_sbrk(int, int);
+ int pause(int);
+ int uptime(void);
+ int sync(void);
++int settickets(int);
+ 
+ // ulib.c
+ int stat(const char *, struct stat *);
+diff --git a/user/usys.pl b/user/usys.pl
+index 4d054e8..59d43b2 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -43,3 +43,4 @@ entry("sbrk");
+ entry("pause");
+ entry("uptime");
+ entry("sync");
++entry("settickets");
